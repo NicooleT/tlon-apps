@@ -33,8 +33,9 @@ export function AudioRecorderSheet({
         // automatically start recording whenever opened
         audioRecorderRef.current?.startRecording();
       } else {
-        audioRecorderRef.current?.stopRecording();
-        audioRecorderRef.current?.stopPlayback();
+        void audioRecorderRef.current?.stopActiveMedia().catch((error) => {
+          console.error('Failed to stop active audio on sheet close', error);
+        });
       }
 
       if (!open) {

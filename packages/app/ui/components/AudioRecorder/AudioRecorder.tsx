@@ -24,6 +24,10 @@ import { useTheme } from 'tamagui';
 
 import { useAppStatusChange } from '../../../hooks/useAppStatusChange';
 import {
+  getActiveAudioRecorderStopAction,
+  type AudioRecorderState,
+} from './AudioRecorderState';
+import {
   FinishMode,
   IWaveformRef,
   PlayerState,
@@ -33,17 +37,12 @@ import {
   useExtractWaveformDataCallback,
 } from './react-native-audio-waveform';
 
-type State =
-  | {
-      live: true;
-      recorderState: RecorderState;
-      duration: { elapsed: number; playbackStartedAt?: Date };
-    }
-  | { live: false; playbackState: PlayerState; audioFilePath: string };
+type State = AudioRecorderState;
 
 interface AudioRecorderMethods {
   enterRecordingMode(): void;
   enterPlaybackMode(audioFilePath: string): void;
+  stopActiveMedia(): Promise<void>;
   startRecording(): Promise<void>;
   stopRecording(): Promise<void>;
   pauseRecording(): Promise<void>;
@@ -108,6 +107,7 @@ export const AudioRecorder = forwardRef<
           audioFilePath: startInPlaybackModeWithFilePath,
         }
   );
+  const stateRef = useMutableRef(state);
 
   const [elapsedMs, setElapsedMs] = useState<null | number>(null);
   useTimer({
@@ -123,6 +123,41 @@ export const AudioRecorder = forwardRef<
   // NB: `refApi`'s methods are probably what you want instead of this (since they coordinate other state)
   const waveformRef = useRef<IWaveformRef>(null);
   const extractWaveformData = useExtractWaveformDataCallback();
+
+  const stopRecording = useCallback(async () => {
+    const uri = await waveformRef.current?.stopRecord();
+    if (uri == null) {
+      console.warn('No uri returned from stopRecord');
+      Alert.alert('Failed to save recording');
+      onCancel?.(null);
+      return;
+    }
+    setElapsedMs(0);
+    setState({
+      live: false,
+      playbackState: PlayerState.stopped,
+      audioFilePath: uri, // we're mixing up uri / path here, but rn-waveform quietly converts so it's fine
+    });
+  }, [onCancel]);
+
+  const stopPlayback = useCallback(async () => {
+    await waveformRef.current?.stopPlayer();
+  }, []);
+
+  const stopActiveMedia = useCallback(async () => {
+    switch (getActiveAudioRecorderStopAction(stateRef.current)) {
+      case 'recording':
+        await stopRecording();
+        return;
+
+      case 'playback':
+        await stopPlayback();
+        return;
+
+      case null:
+        return;
+    }
+  }, [stateRef, stopPlayback, stopRecording]);
 
   const refApi = useMemo(
     () => ({
@@ -166,21 +201,8 @@ export const AudioRecorder = forwardRef<
           onCancel?.(null);
         }
       },
-      async stopRecording() {
-        const uri = await waveformRef.current?.stopRecord();
-        if (uri == null) {
-          console.warn('No uri returned from stopRecord');
-          Alert.alert('Failed to save recording');
-          onCancel?.(null);
-          return;
-        }
-        setElapsedMs(0);
-        setState({
-          live: false,
-          playbackState: PlayerState.stopped,
-          audioFilePath: uri, // we're mixing up uri / path here, but rn-waveform quietly converts so it's fine
-        });
-      },
+      stopActiveMedia,
+      stopRecording,
       async pauseRecording() {
         await waveformRef.current?.pauseRecord();
       },
@@ -192,9 +214,7 @@ export const AudioRecorder = forwardRef<
           finishMode: FinishMode.stop,
         });
       },
-      async stopPlayback() {
-        await waveformRef.current?.stopPlayer();
-      },
+      stopPlayback,
       async pausePlayback() {
         await waveformRef.current?.pausePlayer();
       },
@@ -202,7 +222,7 @@ export const AudioRecorder = forwardRef<
         await waveformRef.current?.resumePlayer();
       },
     }),
-    [onCancel]
+    [onCancel, stopActiveMedia, stopPlayback, stopRecording]
   );
 
   useImperativeHandle(ref, () => refApi);
@@ -253,10 +273,10 @@ export const AudioRecorder = forwardRef<
   const primaryAction = useMemo<'record' | 'stop-record' | 'submit'>(() => {
     if (state.live) {
       switch (state.recorderState) {
-        case RecorderState.stopped:
-        case RecorderState.paused:
+        case 'stopped':
+        case 'paused':
           return 'record';
-        case RecorderState.recording:
+        case 'recording':
           return 'stop-record';
       }
     } else {
