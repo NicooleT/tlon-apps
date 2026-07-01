@@ -29,7 +29,12 @@ import {
   useRef,
   useState,
 } from 'react';
-import { Keyboard, TextInput } from 'react-native';
+import {
+  Keyboard,
+  TextInput,
+  type NativeSyntheticEvent,
+  type TextInputSelectionChangeEventData,
+} from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import {
   View,
@@ -54,6 +59,10 @@ import {
 } from '../MessageInput/MessageInputBase';
 import { hydrateEditPost } from '../MessageInput/helpers';
 import type { DraftInputHandle } from '../draftInputs/shared';
+import {
+  shouldIgnoreBareChatInputTextChange,
+  shouldRefocusBareChatInputAfterNativeClear,
+} from './BareChatInputState';
 import { contentToTextAndMentions, textAndMentionsToContent } from './helpers';
 import {
   MentionOption,
@@ -284,6 +293,10 @@ function BareChatInput(
     removeAttachment,
   } = useAttachmentContext();
   const [controlledText, setControlledText] = useState('');
+  const [nativeSelection, setNativeSelection] = useState({
+    start: 0,
+    end: 0,
+  });
   const [inputHeight, setInputHeight] = useState(initialHeight);
   const [sendError, setSendError] = useState(false);
   const [hasSetInitialContent, setHasSetInitialContent] = useState(false);
@@ -310,6 +323,7 @@ function BareChatInput(
   } = useMentions({ chatId: groupId ?? channelId, roleOptions });
   const maxInputHeight = useKeyboardHeight(maxInputHeightBasic);
   const inputRef = useRef<TextInput>(null);
+  const ignoreNativeTextChangesRef = useRef(false);
 
   usePasteHandler(addAttachment);
 
@@ -359,8 +373,30 @@ function BareChatInput(
   const lastProcessedRef = useRef('');
   const mentionRef = useRef<MentionController>(null);
 
+  const moveNativeSelectionToEnd = useCallback(
+    (text = controlledText) => {
+      if (isWeb) {
+        return;
+      }
+
+      const selection = { start: text.length, end: text.length };
+      setNativeSelection(selection);
+      inputRef.current?.setNativeProps({ selection });
+    },
+    [controlledText]
+  );
+
   const handleTextChange = useCallback(
     (newText: string) => {
+      if (
+        shouldIgnoreBareChatInputTextChange({
+          isWeb,
+          ignoreNativeTextChanges: ignoreNativeTextChangesRef.current,
+        })
+      ) {
+        return;
+      }
+
       const oldText = controlledText;
 
       bareChatInputLogger.log('text change', newText);
@@ -381,6 +417,7 @@ function BareChatInput(
             ? Math.max(0, cursorPos - (newText.length - textWithoutRefs.length))
             : undefined;
         setControlledText(textWithoutRefs);
+        moveNativeSelectionToEnd(textWithoutRefs);
         handleMention(oldText, textWithoutRefs, adjustedCursorPos);
 
         const jsonContent = textAndMentionsToContent(textWithoutRefs, mentions);
@@ -402,6 +439,7 @@ function BareChatInput(
           ? (inputRef.current as any)?.selectionStart
           : undefined;
         setControlledText(newText);
+        moveNativeSelectionToEnd(newText);
         handleMention(oldText, newText, cursorPos);
 
         const jsonContent = textAndMentionsToContent(newText, mentions);
@@ -409,7 +447,14 @@ function BareChatInput(
         storeDraft(jsonContent);
       }
     },
-    [controlledText, processReferences, handleMention, mentions, storeDraft]
+    [
+      controlledText,
+      processReferences,
+      handleMention,
+      mentions,
+      storeDraft,
+      moveNativeSelectionToEnd,
+    ]
   );
 
   const onMentionSelect = useCallback(
@@ -457,6 +502,18 @@ function BareChatInput(
       inputSessionRef.current += 1;
       setLinkMetaLoading(false);
 
+      if (!isWeb) {
+        ignoreNativeTextChangesRef.current = true;
+        inputRef.current?.clear();
+        moveNativeSelectionToEnd('');
+        if (shouldRefocusBareChatInputAfterNativeClear({ isWeb })) {
+          setTimeout(() => {
+            ignoreNativeTextChangesRef.current = false;
+            inputRef.current?.focus();
+          }, 0);
+        }
+      }
+
       setControlledText('');
       bareChatInputLogger.log('clearing attachments');
       clearAttachments();
@@ -498,6 +555,7 @@ function BareChatInput(
       setMentions,
       initialHeight,
       resetMentionMode,
+      moveNativeSelectionToEnd,
     ]
   );
 
@@ -554,6 +612,10 @@ function BareChatInput(
         attachments.length === 0
     );
   }, [controlledText, attachments]);
+
+  useEffect(() => {
+    moveNativeSelectionToEnd();
+  }, [attachments.length, moveNativeSelectionToEnd]);
 
   // Sync link attachments with URLs in text
   // This effect watches for URL changes and updates link previews accordingly
@@ -848,6 +910,9 @@ function BareChatInput(
   }, [setShouldBlur]);
 
   const handleFocus = useCallback(() => {
+    ignoreNativeTextChangesRef.current = false;
+    moveNativeSelectionToEnd();
+
     // dismiss wayfinding tooltip if needed
     if (logic.isPersonalChatChannel(channelId)) {
       db.wayfindingProgress.setValue((prev) => ({
@@ -861,7 +926,18 @@ function BareChatInput(
         tappedHomeGroupHint: true,
       }));
     }
-  }, [channelId]);
+  }, [channelId, moveNativeSelectionToEnd]);
+
+  const handleSelectionChange = useCallback(
+    (
+      event: NativeSyntheticEvent<TextInputSelectionChangeEventData>
+    ) => {
+      if (!isWeb) {
+        setNativeSelection(event.nativeEvent.selection);
+      }
+    },
+    []
+  );
 
   const handleKeyPress = useCallback(
     (e: any) => {
@@ -959,6 +1035,8 @@ function BareChatInput(
             onBlur={handleBlur}
             onFocus={handleFocus}
             onKeyPress={handleKeyPress}
+            onSelectionChange={handleSelectionChange}
+            selection={!isWeb ? nativeSelection : undefined}
             multiline
             placeholder={placeholder}
             {...(!isWeb ? placeholderTextColor : {})}
